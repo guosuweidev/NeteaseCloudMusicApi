@@ -1,11 +1,18 @@
 const encrypt = require('./crypto')
-const axios = require('axios')
-const queryString = require('querystring')
-const PacProxyAgent = require('pac-proxy-agent')
+const crypto = require('crypto')
+const { default: axios } = require('axios')
+const { PacProxyAgent } = require('pac-proxy-agent')
 const http = require('http')
 const https = require('https')
 const tunnel = require('tunnel')
-const qs = require('url')
+const fs = require('fs')
+const path = require('path')
+const tmpPath = require('os').tmpdir()
+const anonymous_token = fs.readFileSync(
+  path.resolve(tmpPath, './anonymous_token'),
+  'utf-8',
+)
+const { URLSearchParams, URL } = require('url')
 // request.debug = true // 开启可看到更详细信息
 
 const chooseUserAgent = (ua = false) => {
@@ -42,16 +49,43 @@ const chooseUserAgent = (ua = false) => {
     ? realUserAgentList[Math.floor(Math.random() * realUserAgentList.length)]
     : ua
 }
-const createRequest = (method, url, data, options) => {
+const createRequest = (method, url, data = {}, options) => {
   return new Promise((resolve, reject) => {
     let headers = { 'User-Agent': chooseUserAgent(options.ua) }
+    options.headers = options.headers || {}
+    headers = {
+      ...headers,
+      ...options.headers,
+    }
     if (method.toUpperCase() === 'POST')
       headers['Content-Type'] = 'application/x-www-form-urlencoded'
     if (url.includes('music.163.com'))
       headers['Referer'] = 'https://music.163.com'
-    if (options.realIP) headers['X-Real-IP'] = options.realIP
+    let ip = options.realIP || options.ip || ''
+    // console.log(ip)
+    if (ip) {
+      headers['X-Real-IP'] = ip
+      headers['X-Forwarded-For'] = ip
+    }
     // headers['X-Real-IP'] = '118.88.88.88'
-    if (typeof options.cookie === 'object')
+    if (typeof options.cookie === 'object') {
+      options.cookie = {
+        ...options.cookie,
+        __remember_me: true,
+        // NMTID: crypto.randomBytes(16).toString('hex'),
+        _ntes_nuid: crypto.randomBytes(16).toString('hex'),
+      }
+      if (url.indexOf('login') === -1) {
+        options.cookie['NMTID'] = crypto.randomBytes(16).toString('hex')
+      }
+      if (!options.cookie.MUSIC_U) {
+        // 游客
+        if (!options.cookie.MUSIC_A) {
+          options.cookie.MUSIC_A = anonymous_token
+          options.cookie.os = options.cookie.os || 'ios'
+          options.cookie.appver = options.cookie.appver || '8.10.90'
+        }
+      }
       headers['Cookie'] = Object.keys(options.cookie)
         .map(
           (key) =>
@@ -60,12 +94,15 @@ const createRequest = (method, url, data, options) => {
             encodeURIComponent(options.cookie[key]),
         )
         .join('; ')
-    else if (options.cookie) headers['Cookie'] = options.cookie
-
-    if (!headers['Cookie']) {
-      headers['Cookie'] = options.token || ''
+    } else if (options.cookie) {
+      headers['Cookie'] = options.cookie
+    } else {
+      headers['Cookie'] = '__remember_me=true; NMTID=xxx'
     }
+    // console.log(options.cookie, headers['Cookie'])
     if (options.crypto === 'weapi') {
+      headers['User-Agent'] =
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36 Edg/116.0.1938.69'
       let csrfToken = (headers['Cookie'] || '').match(/_csrf=([^(;|$)]+)/)
       data.csrf_token = csrfToken ? csrfToken[1] : ''
       data = encrypt.weapi(data)
@@ -85,7 +122,7 @@ const createRequest = (method, url, data, options) => {
       const header = {
         osver: cookie.osver, //系统版本
         deviceId: cookie.deviceId, //encrypt.base64.encode(imei + '\t02:00:00:00:00:00\t5106025eb79a5247\t70ffbaac7')
-        appver: cookie.appver || '8.0.0', // app版本
+        appver: cookie.appver || '8.9.70', // app版本
         versioncode: cookie.versioncode || '140', //版本号
         mobilename: cookie.mobilename, //设备model
         buildver: cookie.buildver || Date.now().toString().substr(0, 10),
@@ -109,13 +146,12 @@ const createRequest = (method, url, data, options) => {
       data = encrypt.eapi(options.url, data)
       url = url.replace(/\w*api/, 'eapi')
     }
-
     const answer = { status: 500, body: {}, cookie: [] }
     let settings = {
       method: method,
       url: url,
       headers: headers,
-      data: queryString.stringify(data),
+      data: new URLSearchParams(data).toString(),
       httpAgent: new http.Agent({ keepAlive: true }),
       httpsAgent: new https.Agent({ keepAlive: true }),
     }
@@ -127,12 +163,18 @@ const createRequest = (method, url, data, options) => {
         settings.httpAgent = new PacProxyAgent(options.proxy)
         settings.httpsAgent = new PacProxyAgent(options.proxy)
       } else {
-        const purl = qs.parse(options.proxy)
+        const purl = new URL(options.proxy)
         if (purl.hostname) {
-          const agent = tunnel.httpsOverHttp({
+          const agent = tunnel[
+            purl.protocol === 'https' ? 'httpsOverHttp' : 'httpOverHttp'
+          ]({
             proxy: {
               host: purl.hostname,
               port: purl.port || 80,
+              proxyAuth:
+                purl.username && purl.password
+                  ? purl.username + ':' + purl.password
+                  : '',
             },
           })
           settings.httpsAgent = agent
@@ -163,8 +205,11 @@ const createRequest = (method, url, data, options) => {
           } else {
             answer.body = body
           }
+          if (answer.body.code) {
+            answer.body.code = Number(answer.body.code)
+          }
 
-          answer.status = answer.body.code || res.status
+          answer.status = Number(answer.body.code || res.status)
           if (
             [201, 302, 400, 502, 800, 801, 802, 803].indexOf(answer.body.code) >
             -1
